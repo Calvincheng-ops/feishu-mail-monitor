@@ -17,6 +17,8 @@ requires:
 
 IMAP IDLE 实时邮件监控 — 通过邮件协议层的服务器推送，在新邮件到达时即时推送飞书 Bot 消息卡片给用户。无需公网地址，无需轮询，无需额外 SDK。
 
+本仓库根目录的 `feishu-mail-monitor.py`、`feishu-mail-monitor.service` 和 `.env.template` 是 VPS 生产快照。恢复或下线原服务时以这三个文件为准；下文嵌入的脚本和 unit 与它们一致。
+
 ## 工作原理
 
 ```
@@ -34,7 +36,7 @@ IMAP IDLE 实时邮件监控 — 通过邮件协议层的服务器推送，在�
 3. 服务器有新邮件时推送 `EXISTS` 通知（零延迟）
 4. 用 `FETCH` 获取邮件（主题、发件人、收件人、正文摘要）
 5. 通过 lark-cli Bot API 发送飞书消息卡片到用户私聊
-6. 可选：调用 `email_processor.py` 子进程分类解析并写入云文档
+6. 可选（生产快照未启用）：调用 `email_processor.py` 子进程分类解析并写入云文档
 7. 记录最新邮件 UID 到 `.last-uid`，避免重复推送
 8. 每 9 分钟超时后主动 SEARCH 兜底（防止 EXISTS 通知丢失）
 
@@ -103,7 +105,7 @@ lark-cli mail user_mailboxes profile --params '{"user_mailbox_id":"me"}' --as us
 
 提取 `primary_email_address` 作为 `IMAP_USER`，`openId` 作为 `BOT_RECEIVE_ID`。
 
-检查 `${DEPLOY_DIR}` 是否有现有脚本。有则 Read 续改；无则按下方脚本生成。
+检查 `${DEPLOY_DIR}` 是否有现有脚本。有则对照仓库根目录 `feishu-mail-monitor.py` 续改；无则复制该文件。不要用与生产快照不一致的脚本覆盖它。
 
 ### 阶段 1：验证 Bot 通道
 
@@ -118,14 +120,20 @@ lark-cli api POST '/open-apis/im/v1/messages' \
 
 ### 阶段 3：验证 IMAP 密码（见上方第三步）
 
-### 阶段 4：生成脚本和配置
+### 阶段 4：放置生产快照
 
-按下方「完整脚本」和 `.env` 模板生成文件到 `${DEPLOY_DIR}`。
+将仓库根目录的 VPS 生产文件放到 `${DEPLOY_DIR}`（生产机为 `/root/mail-monitor`）：
+
+- `feishu-mail-monitor.py`
+- `feishu-mail-monitor.service`（Linux）
+- `.env.template` 复制为 `.env`，只在服务器上填写真实值
+
+下方嵌入脚本与 `feishu-mail-monitor.py` 一致。不要另写一份不同的监控脚本覆盖生产文件。
 
 ### 阶段 5：部署
 
-- **macOS**：生成 plist → 用户 `cp` 到 `~/Library/LaunchAgents/` → `launchctl load`
-- **Linux**：生成 systemd service → `systemctl enable --now`
+- **macOS**：按下方 plist 生成文件 → 用户 `cp` 到 `~/Library/LaunchAgents/` → `launchctl load`
+- **Linux**：安装仓库里的 `feishu-mail-monitor.service`（不要改写成另一份 unit）→ `systemctl daemon-reload` → `systemctl enable --now feishu-mail-monitor`
 
 ### 阶段 6：确认运行
 
@@ -154,30 +162,19 @@ with smtplib.SMTP_SSL('smtp.feishu.cn', 465) as s:
 
 ### .env 模板
 
+与仓库根目录 `.env.template` 相同（VPS 生产模板，只有占位符）。复制为 `/root/mail-monitor/.env` 后填写。
+
 ```bash
-# ── IMAP ────────────────────────────────────────────────────────────────
 IMAP_HOST=imap.feishu.cn
 IMAP_PORT=993
-IMAP_USER=<email_address>
-IMAP_PASS=<imap_app_password>
-
-# ── Bot 通知 ────────────────────────────────────────────────────────────
-BOT_RECEIVE_ID=<user_open_id>
-# lark-cli 需要 HERMES_HOME 才能找到 bot 身份（关键！）
-HERMES_HOME=/root/.hermes
-
-# ── 可选：Webhook 兜底 ──────────────────────────────────────────────────
-# FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
-
-# ── 可选：云文档回填 ────────────────────────────────────────────────────
-# DOC_TOKEN=<doc_token>
-# DOC_INSERT_AFTER_BLOCK=<anchor_block_id>
-
-# ── 可选：调参 ──────────────────────────────────────────────────────────
-# IDLE_TIMEOUT=540
-# RECONNECT_DELAY=30
-# ERROR_DEDUP_SECONDS=300
+IMAP_USER=your-email@example.com
+IMAP_PASS=your-imap-app-password
+BOT_APP_ID=cli_xxxxxxxxxxxxxxxx
+BOT_RECEIVE_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+WORK_DIR=/root/mail-monitor
 ```
+
+`HERMES_HOME` 和 `LARK_STATE_DIR` 不在这份模板里，由生产 unit 的 `Environment=` 注入。IDLE 超时（9 分钟）、重连等待（30 秒）和相同错误去重（5 分钟）写死在生产脚本中，不从环境变量读取。
 
 ### macOS launchd plist
 
@@ -234,6 +231,8 @@ launchctl load ~/Library/LaunchAgents/com.${USERNAME}.feishu-mail-monitor.plist
 
 ### Linux systemd service
 
+仓库根目录的 `feishu-mail-monitor.service` 就是 VPS 生产 unit。路径固定为 `/root/mail-monitor`：
+
 ```ini
 [Unit]
 Description=Feishu Mail Monitor (IMAP IDLE)
@@ -243,39 +242,61 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=${DEPLOY_DIR}
-EnvironmentFile=${DEPLOY_DIR}/.env
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/root/mail-monitor
+EnvironmentFile=/root/mail-monitor/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/bin
 Environment=HOME=/root
+Environment=LARK_STATE_DIR=/root/.lark-cli
 Environment=HERMES_HOME=/root/.hermes
-ExecStart=/usr/bin/python3 ${DEPLOY_DIR}/feishu-mail-monitor.py
+ExecStart=/usr/bin/python3 /root/mail-monitor/feishu-mail-monitor.py
 Restart=always
 RestartSec=30
-StandardOutput=append:${DEPLOY_DIR}/stdout.log
-StandardError=append:${DEPLOY_DIR}/stderr.log
+StandardOutput=append:/root/mail-monitor/stdout.log
+StandardError=append:/root/mail-monitor/stderr.log
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+**安装**（在仓库根目录执行）：
+
+```bash
+sudo mkdir -p /root/mail-monitor
+sudo cp feishu-mail-monitor.py /root/mail-monitor/feishu-mail-monitor.py
+if [ ! -f /root/mail-monitor/.env ]; then
+  sudo cp .env.template /root/mail-monitor/.env
+  sudo chmod 600 /root/mail-monitor/.env
+fi
+# 编辑 /root/mail-monitor/.env，填入 IMAP_USER、IMAP_PASS、BOT_APP_ID、BOT_RECEIVE_ID
+sudo cp feishu-mail-monitor.service /etc/systemd/system/feishu-mail-monitor.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now feishu-mail-monitor
+systemctl status feishu-mail-monitor
+```
+
 **管理**：
+
 ```bash
 systemctl status feishu-mail-monitor
 systemctl restart feishu-mail-monitor
-tail -f ${DEPLOY_DIR}/monitor.log
+tail -f /root/mail-monitor/monitor.log
 ```
+
+改脚本后先 `cp` 到 `/root/mail-monitor/`，再 `systemctl restart feishu-mail-monitor`。lark-cli 身份依赖 unit 里的 `HERMES_HOME=/root/.hermes` 与 `LARK_STATE_DIR=/root/.lark-cli`。
 
 ## 完整脚本
 
 ### feishu-mail-monitor.py
+
+以下与仓库根目录 [`feishu-mail-monitor.py`](feishu-mail-monitor.py) 逐字相同，即 VPS 生产脚本。`BOT_APP_ID` 与 `BOT_RECEIVE_ID` 的代码默认值为空字符串，真实 ID 只放在服务器 `.env`，不入库。
 
 ```python
 #!/usr/bin/env python3
 """
 Feishu Mail Monitor — IMAP IDLE real-time email notification via Feishu Bot.
 
-Pure stdlib (imaplib + email + select + subprocess). No pip packages needed.
-Depends on lark-cli for Bot API calls.
+Connects to imap.feishu.cn, enters IDLE mode, and pushes Feishu message
+cards to the user's private chat when new mail arrives.
 """
 
 import imaplib
@@ -304,17 +325,17 @@ IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 IMAP_USER = os.environ["IMAP_USER"]
 IMAP_PASS = os.environ["IMAP_PASS"]
 
-BOT_RECEIVE_ID = os.environ["BOT_RECEIVE_ID"]
-FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "")
+# Real IDs belong in .env only (see .env.template). Keep these defaults empty.
+BOT_APP_ID = os.environ.get("BOT_APP_ID", "")
+BOT_RECEIVE_ID = os.environ.get("BOT_RECEIVE_ID", "")
 
 WORK_DIR = Path(os.environ.get("WORK_DIR", Path(__file__).parent))
 LAST_UID_FILE = WORK_DIR / ".last-uid"
 LOG_FILE = WORK_DIR / "monitor.log"
 
-IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "540"))
-RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "30"))
-BODY_PREVIEW_LEN = 500
-ERROR_DEDUP = int(os.environ.get("ERROR_DEDUP_SECONDS", "300"))
+IDLE_TIMEOUT = 9 * 60        # 9 minutes — IMAP IDLE server usually times out at 29 min
+RECONNECT_DELAY = 30          # seconds before reconnecting after error
+BODY_PREVIEW_LEN = 500        # chars of body to include in notification
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -423,6 +444,7 @@ def extract_body(msg: email.message.Message, max_chars: int = BODY_PREVIEW_LEN) 
             else:
                 body = raw
 
+    # Collapse whitespace
     body = re.sub(r"\s+", " ", body).strip()
     return body[:max_chars] if body else "(无正文)"
 
@@ -432,13 +454,11 @@ def parse_email(raw_bytes: bytes) -> dict:
     msg = email.message_from_bytes(raw_bytes)
     subject = decode_header_value(msg.get("Subject", ""))
     sender = decode_header_value(msg.get("From", ""))
-    recipient = msg.get("To", "")
     date_str = msg.get("Date", "")
     body = extract_body(msg)
     return {
         "subject": subject or "(无主题)",
         "sender": sender,
-        "recipient": recipient,
         "date": date_str,
         "body": body,
     }
@@ -447,37 +467,8 @@ def parse_email(raw_bytes: bytes) -> dict:
 # ── Feishu notification ─────────────────────────────────────────────────────
 
 
-def _lark_send(msg_type: str, content: str) -> bool:
-    """Send via lark-cli Bot API. Returns True on success."""
-    try:
-        result = subprocess.run(
-            [
-                "lark-cli", "api", "POST",
-                "/open-apis/im/v1/messages",
-                "--params", json.dumps({"receive_id_type": "open_id"}),
-                "--data", json.dumps({
-                    "receive_id": BOT_RECEIVE_ID,
-                    "msg_type": msg_type,
-                    "content": content,
-                }, ensure_ascii=False),
-                "--as", "bot",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            resp = json.loads(result.stdout)
-            if resp.get("code") == 0:
-                return True
-            log.error("Bot API error: %s", result.stdout[:200])
-        else:
-            log.error("lark-cli error: %s", result.stderr[:200])
-    except Exception as e:
-        log.error("lark-cli exception: %s", e)
-    return False
-
-
 def build_card(info: dict) -> str:
-    """Build a Feishu interactive message card."""
+    """Build a Feishu interactive message card JSON string."""
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -507,33 +498,74 @@ def build_card(info: dict) -> str:
 
 
 def notify(info: dict) -> bool:
-    """Send new-email notification. Card first, plain text fallback."""
+    """Send a Feishu bot message card. Returns True on success."""
     card_json = build_card(info)
-    if _lark_send("interactive", card_json):
-        log.info("✅ Card sent: %s", info["subject"])
-        return True
+    payload = json.dumps({
+        "receive_id": BOT_RECEIVE_ID,
+        "msg_type": "interactive",
+        "content": card_json,
+    }, ensure_ascii=False)
+
+    try:
+        result = subprocess.run(
+            [
+                "lark-cli", "api", "POST",
+                "/open-apis/im/v1/messages",
+                "--params", json.dumps({"receive_id_type": "open_id"}),
+                "--data", payload,
+                "--as", "bot",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            resp = json.loads(result.stdout)
+            if resp.get("code") == 0:
+                log.info("✅ Notification sent: %s", info["subject"])
+                return True
+            else:
+                log.error("❌ Bot API error: %s", result.stdout)
+        else:
+            log.error("❌ lark-cli error: %s", result.stderr)
+    except Exception as e:
+        log.error("❌ Notify exception: %s", e)
 
     # Fallback: plain text
-    text = f"📧 新邮件\n主题: {info['subject']}\n发件人: {info['sender']}\n{info['body'][:200]}"
-    if _lark_send("text", json.dumps({"text": text}, ensure_ascii=False)):
-        log.info("✅ Fallback text sent: %s", info["subject"])
+    try:
+        text = f"📧 新邮件\n主题: {info['subject']}\n发件人: {info['sender']}\n{info['body'][:200]}"
+        subprocess.run(
+            [
+                "lark-cli", "api", "POST",
+                "/open-apis/im/v1/messages",
+                "--params", json.dumps({"receive_id_type": "open_id"}),
+                "--data", json.dumps({
+                    "receive_id": BOT_RECEIVE_ID,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                }, ensure_ascii=False),
+                "--as", "bot",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        log.info("Fallback plain text sent")
         return True
+    except Exception as e:
+        log.error("❌ Fallback notify failed: %s", e)
+        return False
 
-    log.error("❌ All notification methods failed for: %s", info["subject"])
-    return False
 
-
-# ── Error notification ───────────────────────────────────────────────────────
+# ── Error notification ────────────────────────────────────────────────────────
 
 _last_error_msg = ""
 _last_error_time = 0
+_ERROR_COOLDOWN = 300  # don't repeat same error within 5 minutes
 
 
 def notify_error(error_msg: str, context: str = "") -> bool:
-    """Send a red error alert card. 5-min dedup for same error."""
+    """Send an error alert to the user via Feishu bot. Deduplicates within cooldown."""
     global _last_error_msg, _last_error_time
     now = time.time()
-    if error_msg == _last_error_msg and (now - _last_error_time) < ERROR_DEDUP:
+    # Dedup: skip if same error within cooldown
+    if error_msg == _last_error_msg and (now - _last_error_time) < _ERROR_COOLDOWN:
         return False
     _last_error_msg = error_msg
     _last_error_time = now
@@ -554,20 +586,49 @@ def notify_error(error_msg: str, context: str = "") -> bool:
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": body}},
             {"tag": "hr"},
-            {"tag": "note", "elements": [
-                {"tag": "plain_text", "content": "服务将继续自动重试。持续报错请检查日志。"}
-            ]},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "服务将继续自动重试。如持续报错请检查日志: /root/mail-monitor/monitor.log"}]},
         ],
     }
+    card_json = json.dumps(card, ensure_ascii=False)
+    payload = json.dumps({
+        "receive_id": BOT_RECEIVE_ID,
+        "msg_type": "interactive",
+        "content": card_json,
+    }, ensure_ascii=False)
 
-    if _lark_send("interactive", json.dumps(card, ensure_ascii=False)):
-        log.info("🚨 Error notification sent")
+    try:
+        result = subprocess.run(
+            ["lark-cli", "api", "POST", "/open-apis/im/v1/messages",
+             "--params", json.dumps({"receive_id_type": "open_id"}),
+             "--data", payload, "--as", "bot"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            resp = json.loads(result.stdout)
+            if resp.get("code") == 0:
+                log.info("🚨 Error notification sent")
+                return True
+        log.error("Failed to send error notification: %s", result.stdout[:200])
+    except Exception as e:
+        log.error("Error notification exception: %s", e)
+
+    # Fallback: plain text
+    try:
+        text = f"🚨 邮件监控异常\n{ts}\n{context}\n{error_msg}"
+        subprocess.run(
+            ["lark-cli", "api", "POST", "/open-apis/im/v1/messages",
+             "--params", json.dumps({"receive_id_type": "open_id"}),
+             "--data", json.dumps({
+                 "receive_id": BOT_RECEIVE_ID,
+                 "msg_type": "text",
+                 "content": json.dumps({"text": text}, ensure_ascii=False),
+             }, ensure_ascii=False),
+             "--as", "bot"],
+            capture_output=True, text=True, timeout=30,
+        )
         return True
-
-    # Fallback
-    text = f"🚨 邮件监控异常\n{ts}\n{context}\n{error_msg}"
-    _lark_send("text", json.dumps({"text": text}, ensure_ascii=False))
-    return True
+    except Exception:
+        return False
 
 
 # ── IMAP helpers ─────────────────────────────────────────────────────────────
@@ -621,11 +682,8 @@ def fetch_and_notify(m: imaplib.IMAP4_SSL, uid_from: int) -> int:
 
 def do_idle(m: imaplib.IMAP4_SSL) -> str:
     """
-    Send IDLE and wait for data or timeout.
-    Returns: 'exists' if new mail, 'timeout' if expired, 'error' on failure.
-
-    Critical: uses sock.recv() not readline() — imap.feishu.cn can bundle
-    multiple responses in one TCP segment.
+    Send IDLE command and wait for data or timeout.
+    Returns: 'exists' if new mail, 'timeout' if idle expired, 'error' on failure.
     """
     tag = m._new_tag()
     m.send(f"{tag} IDLE\r\n".encode())
@@ -635,6 +693,7 @@ def do_idle(m: imaplib.IMAP4_SSL) -> str:
     if b"+" not in resp:
         return "error"
 
+    # Wait for data on the socket with timeout
     sock = m.socket()
     try:
         ready, _, _ = select.select([sock], [], [], IDLE_TIMEOUT)
@@ -642,17 +701,18 @@ def do_idle(m: imaplib.IMAP4_SSL) -> str:
         return "error"
 
     if not ready:
-        # Timeout — send DONE gracefully
+        # Timeout — send DONE to exit IDLE gracefully
         try:
             m.send(b"DONE\r\n")
-            m.readline()
+            m.readline()  # read tagged response
         except Exception:
             pass
         return "timeout"
 
-    # Data arrived — read ALL buffered data at once (not readline!)
+    # Data arrived — read ALL available lines, look for EXISTS
     result = "timeout"
     try:
+        # Read everything that's available
         buf = b""
         sock.setblocking(False)
         try:
@@ -666,6 +726,7 @@ def do_idle(m: imaplib.IMAP4_SSL) -> str:
         finally:
             sock.setblocking(True)
 
+        # Parse buffered lines
         for line_bytes in buf.split(b"\n"):
             line_bytes = line_bytes.strip()
             if not line_bytes:
@@ -675,11 +736,14 @@ def do_idle(m: imaplib.IMAP4_SSL) -> str:
                 result = "exists"
                 log.debug("IDLE notification: %s", line_str)
 
-        # Send DONE and read tagged response
+        # Now send DONE and read the tagged response
         m.send(b"DONE\r\n")
+        # Read until we get the tagged OK response
         while True:
             resp_line = m.readline()
-            if not resp_line or resp_line.startswith(tag.encode()):
+            if not resp_line:
+                break
+            if resp_line.startswith(tag.encode()):
                 break
 
     except Exception as e:
@@ -694,8 +758,9 @@ def do_idle(m: imaplib.IMAP4_SSL) -> str:
 def main():
     log.info("═══ Feishu Mail Monitor starting ═══")
     log.info("IMAP_USER=%s, BOT_RECEIVE_ID=%s", IMAP_USER, BOT_RECEIVE_ID)
+    log.info("lark-cli: %s", "found" if sys.executable else "NOT FOUND")
 
-    # Check lark-cli
+    # Check lark-cli exists
     try:
         subprocess.run(["lark-cli", "--version"], capture_output=True, timeout=5)
         log.info("lark-cli: found")
@@ -718,11 +783,11 @@ def main():
                     if uids:
                         last_uid = max(uids)
                         write_last_uid(last_uid)
-                        log.info("First run: baseline UID=%d (only newer mail will notify)", last_uid)
+                        log.info("First run: set baseline UID to %d (will only notify for newer mail)", last_uid)
                 else:
                     log.info("First run: inbox empty, baseline UID=0")
             else:
-                # Reconnect: catch up on missed mail
+                # Reconnect: catch up on any mail received while disconnected
                 last_uid = fetch_and_notify(m, last_uid)
                 write_last_uid(last_uid)
 
@@ -733,8 +798,7 @@ def main():
                     last_uid = fetch_and_notify(m, last_uid)
                     write_last_uid(last_uid)
                 elif idle_result == "timeout":
-                    # CRITICAL: always SEARCH on timeout — EXISTS can be lost
-                    log.info("IDLE timeout, proactive SEARCH")
+                    log.info("IDLE timeout, proactively checking for new mail")
                     last_uid = fetch_and_notify(m, last_uid)
                     write_last_uid(last_uid)
                 elif idle_result == "error":
@@ -766,9 +830,9 @@ if __name__ == "__main__":
     main()
 ```
 
-### email_processor.py（可选）
+### email_processor.py（可选，不在 VPS 生产快照内）
 
-邮件分类 + 云文档回填的可选子进程。由 `feishu-mail-monitor.py` 在通知后调用，通过 JSON stdin 接收邮件数据。
+邮件分类 + 云文档回填的可选子进程。当前 VPS 上的 `feishu-mail-monitor.py` 不会调用它，仓库里也没有这个文件。下面只是以后若要加回填时的接口说明。
 
 **函数签名**：
 
@@ -795,7 +859,7 @@ def process_to_doc(info: dict) -> None:
     非目标邮件（category_key == 'skip'）不写文档。"""
 ```
 
-**调用方式**（在 feishu-mail-monitor.py 的 notify() 之后）：
+**调用方式**（生产脚本没有这段。若要启用，可在 `notify()` 成功之后追加）：
 
 ```python
 import subprocess, json
@@ -820,7 +884,7 @@ except Exception as e:
 | `wrong authorization code` | IMAP 密码错或管理后台未开 | 重生成密码，检查后台开关 |
 | `lark-cli not found` | npm prefix/bin 不在 PATH | `npm config get prefix`，加入 plist/systemd PATH |
 | Bot 发不出消息 | token 过期/权限不足 | `lark-cli auth login --scope "im:message:send"` |
-| Bot 报 `not_configured` | 缺 `HERMES_HOME` 环境变量 | service 文件加 `Environment=HERMES_HOME=/root/.hermes` |
+| Bot 报 `not_configured` | 缺 `HERMES_HOME` | 生产 unit 已含 `Environment=HERMES_HOME=/root/.hermes` 与 `LARK_STATE_DIR=/root/.lark-cli` |
 | IDLE 检测不到新邮件 | EXISTS 通知丢失 | 已内置：timeout 时主动 SEARCH 兜底 |
 | `email.message` 属性错误 | 缺显式 import | 脚本已加 `import email.message` |
 | `str(m.capability)` 返回 repr | 用法错误 | 改用 `m.capability()` → `(status, data)` |
@@ -838,7 +902,7 @@ except Exception as e:
 ### 1. HERMES_HOME 环境变量是必须的
 
 `lark-cli` 从 `$HERMES_HOME` 读取 bot 身份。缺失时所有命令返回 `not_configured`。
-必须同时在 `.env` 和 systemd `Environment=`（或 launchd `EnvironmentVariables`）中设置。
+VPS 生产 unit 用 `Environment=HERMES_HOME=/root/.hermes` 和 `Environment=LARK_STATE_DIR=/root/.lark-cli` 注入，不写进 `.env.template`。macOS 则放在 launchd `EnvironmentVariables`。
 
 ### 2. IDLE EXISTS 通知会静默丢失
 
@@ -886,7 +950,8 @@ Python 类型注解 `email.message.Message` 需要直接 import。只写 `import
 
 ## 安全
 
-- `.env` 含 IMAP 专用密码，勿提交 git
+- `.env` 含 IMAP 专用密码，勿提交 git。`.last-uid`、`monitor.log`、`stdout.log`、`stderr.log` 同样不要入库
+- 不要把真实 `BOT_APP_ID` / `BOT_RECEIVE_ID` 写进脚本默认值
 - IMAP 专用密码只用于邮件读取，不能登录飞书
 - lark-cli 状态含 token，传输到云服务器后删除本地 tar.gz
 

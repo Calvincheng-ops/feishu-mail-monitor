@@ -1,0 +1,22 @@
+[Unit]
+Description=Feishu Mail Monitor (IMAP IDLE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mail-monitor
+EnvironmentFile=/root/mail-monitor/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/bin
+Environment=HOME=/root
+Environment=LARK_STATE_DIR=/root/.lark-cli
+Environment=HERMES_HOME=/root/.hermes
+ExecStart=/usr/bin/python3 /root/mail-monitor/feishu-mail-monitor.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/root/mail-monitor/stdout.log
+StandardError=append:/root/mail-monitor/stderr.log
+
+[Install]
+WantedBy=multi-user.target
