@@ -21,7 +21,7 @@ IMAP IDLE 实时飞书邮件监控 — 新邮件到达时即时推送飞书 Bot 
 - 🔴 **异常告警** — 出错时推送红色告警卡片，5 分钟同错误去重
 - 🔄 **断线重连** — 网络断开自动重连，补推断连期间的邮件
 - 🛡️ **兜底检查** — 每 9 分钟主动 SEARCH，防止 EXISTS 通知丢失
-- 📋 **可选扩展** — 邮件分类 + 飞书云文档自动回填
+- 📋 **生产快照** — 脚本、systemd unit 与 `.env.template` 来自 VPS，可在下线原服务后按本文恢复
 - 🐧 **跨平台** — macOS launchd / Linux systemd 均支持
 
 ## 快速开始
@@ -72,36 +72,57 @@ lark-cli api POST '/open-apis/im/v1/messages' \
 
 ```bash
 cp .env.template .env
-# 编辑 .env 填入实际值
+# 编辑 .env，填入 IMAP_USER、IMAP_PASS、BOT_APP_ID、BOT_RECEIVE_ID
 ```
+
+`.env` 已被 `.gitignore` 忽略。VPS 上的正式文件是 `/root/mail-monitor/.env`。
 
 ### 5. 部署
 
-**macOS (launchd)**：
-```bash
-cp com.yourname.feishu-mail-monitor.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.yourname.feishu-mail-monitor.plist
-```
+生产环境是 Linux VPS，工作目录 `/root/mail-monitor`。`feishu-mail-monitor.service` 里的路径是写死的，恢复时保持这一布局。下面的命令只在服务器上还没有 `.env` 时从模板复制，避免盖掉已经填好的密码。
 
-**Linux (systemd)**：
 ```bash
-sudo cp feishu-mail-monitor.service /etc/systemd/system/
+sudo mkdir -p /root/mail-monitor
+sudo cp feishu-mail-monitor.py /root/mail-monitor/feishu-mail-monitor.py
+if [ ! -f /root/mail-monitor/.env ]; then
+  sudo cp .env.template /root/mail-monitor/.env
+  sudo chmod 600 /root/mail-monitor/.env
+fi
+# 编辑 /root/mail-monitor/.env，填入 IMAP_USER、IMAP_PASS、BOT_APP_ID、BOT_RECEIVE_ID
+sudo cp feishu-mail-monitor.service /etc/systemd/system/feishu-mail-monitor.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now feishu-mail-monitor
+systemctl status feishu-mail-monitor
 ```
+
+改脚本后重新装上并重启：
+
+```bash
+sudo cp feishu-mail-monitor.py /root/mail-monitor/feishu-mail-monitor.py
+sudo systemctl restart feishu-mail-monitor
+tail -f /root/mail-monitor/monitor.log
+```
+
+unit 通过 `Environment=` 注入 `HERMES_HOME=/root/.hermes` 和 `LARK_STATE_DIR=/root/.lark-cli`，lark-cli 靠这两项目录找到 bot 身份。标准输出和错误分别追加到 `/root/mail-monitor/stdout.log` 与 `stderr.log`。
+
+macOS launchd 的 plist 模板在 [SKILL.md](SKILL.md)。本仓库不附带 plist 文件。
 
 ## 项目结构
 
 ```
-├── feishu-mail-monitor.py    # 主脚本（IMAP IDLE + Bot 通知）
-├── email_processor.py        # 邮件分类 + 云文档回填（可选）
-├── .env                      # 配置（含密码，勿提交 git）
-├── .env.template             # 配置模板
-├── .last-uid                 # 最后处理的邮件 UID（自动维护）
-└── monitor.log               # 运行日志
+├── feishu-mail-monitor.py       # 主脚本（VPS 生产快照）
+├── feishu-mail-monitor.service  # systemd unit（工作目录 /root/mail-monitor）
+├── .env.template                # 生产配置模板（占位符，无密钥）
+├── .gitignore                   # 忽略 .env、.last-uid、*.log
+├── README.md
+└── SKILL.md
 ```
 
+运行时文件不要提交：`.env`（由模板复制）、`.last-uid`、`monitor.log`、`stdout.log`、`stderr.log`。
+
 ## 配置说明
+
+`.env` 由 `.env.template` 复制。不要把 `.env`、`.last-uid` 或日志提交到 git。脚本里 `BOT_APP_ID` / `BOT_RECEIVE_ID` 的默认值是空字符串，真实 ID 只放在服务器 `.env`。
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
@@ -109,12 +130,20 @@ sudo systemctl enable --now feishu-mail-monitor
 | `IMAP_PORT` | 否 | 端口，默认 `993` |
 | `IMAP_USER` | **是** | 飞书邮箱地址 |
 | `IMAP_PASS` | **是** | IMAP 专用密码（非登录密码） |
+| `BOT_APP_ID` | 否 | 飞书应用 ID。生产脚本会读取；发消息使用本机已登录的 lark-cli |
 | `BOT_RECEIVE_ID` | **是** | 接收通知的用户 open_id |
-| `HERMES_HOME` | **是** | lark-cli 配置目录，如 `/root/.hermes` |
-| `FEISHU_WEBHOOK` | 否 | Webhook 兜底地址 |
-| `IDLE_TIMEOUT` | 否 | IDLE 超时秒数，默认 `540` |
-| `RECONNECT_DELAY` | 否 | 重连等待秒数，默认 `30` |
-| `ERROR_DEDUP_SECONDS` | 否 | 错误去重间隔，默认 `300` |
+| `WORK_DIR` | 否 | `.last-uid` 与 `monitor.log` 所在目录，默认脚本所在目录。生产为 `/root/mail-monitor` |
+
+systemd unit 另外注入（不写在 `.env.template` 里）：
+
+| 变量 | 生产值 | 说明 |
+|------|--------|------|
+| `HERMES_HOME` | `/root/.hermes` | lark-cli bot 身份目录。缺失时 API 返回 `not_configured` |
+| `LARK_STATE_DIR` | `/root/.lark-cli` | lark-cli 状态目录 |
+| `HOME` | `/root` | 服务用户的家目录 |
+| `PATH` | `/usr/local/bin:/usr/bin:/bin:/usr/local/bin` | 保证能找到 `lark-cli` |
+
+脚本内写死、不读环境变量：IDLE 超时 9 分钟，重连等待 30 秒，相同错误告警去重 5 分钟。
 
 ## 通知效果
 
@@ -146,7 +175,7 @@ sudo systemctl enable --now feishu-mail-monitor
 | 症状 | 解决 |
 |------|------|
 | `wrong authorization code` | 重新生成 IMAP 密码，检查管理后台是否开启第三方登录 |
-| Bot 报 `not_configured` | service 文件加 `Environment=HERMES_HOME=/root/.hermes` |
+| Bot 报 `not_configured` | 生产 unit 已设置 `HERMES_HOME=/root/.hermes` 与 `LARK_STATE_DIR=/root/.lark-cli`，确认这两行还在 |
 | IDLE 检测不到新邮件 | 已内置兜底：每 9 分钟主动 SEARCH |
 | `lark-cli auth status --json` 失败 | 去掉 `--json`，该 flag 不存在 |
 | 脚本改动未生效 | 重启服务（`systemctl restart` 或 `launchctl unload/load`） |
